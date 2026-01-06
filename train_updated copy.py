@@ -106,7 +106,7 @@ class Config:
 
         # training defaults
         self.batch_size = 4
-        self.learning_rate = 2e-4
+        self.learning_rate = 1e-4
         self.weight_decay = 1e-5
         cpu_count = os.cpu_count() or 1
         # Windows multiprocessing DataLoader workers frequently crash; default to 0 there.
@@ -116,8 +116,10 @@ class Config:
         self.num_samples = 4  # patches sampled per volume in RandCropByPosNegLabeld (effective batch multiplier)
         self.use_attention = True
         self.grad_clip_norm = 1.0
+        self.debug_stats_batches = 3
+        self.empty_label_warn_threshold = 5
         self.sw_batch_size = 1
-        self.amp = self.device.startswith("cuda")
+        self.amp = False
 
         # model hyperparameters (customizable via CLI)
         # Default UNet width (matches existing checkpoints)
@@ -162,7 +164,6 @@ class Config:
             d.mkdir(parents=True, exist_ok=True)
         if self.device.startswith("cuda"):
             # CUDA-friendly defaults
-            self.amp = True
             self.compile_model = True
             self.use_attention = True
             self.pin_memory = True
@@ -284,7 +285,7 @@ class Config:
             cfg.modality = "ct"
             cfg.pixdim = (0.6, 0.6, 0.6)
             cfg.roi_size = (96, 160, 160)
-            cfg.learning_rate = 2e-4
+            cfg.learning_rate = 1e-4
             cfg.batch_size = 1  # safer for large 3D CTA volumes
             cfg.cache_rate_train = 0.10
             cfg.cache_rate_val = 0.25
@@ -308,7 +309,9 @@ class Config:
             cfg.roi_size = tuple(int(x) for x in args.roi_size.split(","))
         if args.num_workers is not None:
             cfg.num_workers = args.num_workers
-        if getattr(args, "grad_clip_norm", None) is not None:
+        if getattr(args, "grad_clip", None) is not None:
+            cfg.grad_clip_norm = args.grad_clip
+        if getattr(args, "grad_clip_norm", None) is not None and getattr(args, "grad_clip", None) is None:
             cfg.grad_clip_norm = args.grad_clip_norm
         if getattr(args, "prefetch_factor", None) is not None:
             cfg.prefetch_factor = max(1, args.prefetch_factor)
@@ -974,13 +977,25 @@ def binarize_label_foreground(x):
     except AttributeError:
         return (x > 0).float()
 
+def safe_ct_window(x, a_min: float, a_max: float):
+    """Clamp and normalize CT intensities safely to [0, 1]."""
+    denom = float(a_max - a_min)
+    if denom <= 0:
+        denom = 1.0
+    try:
+        return torch.clamp(x, min=float(a_min), max=float(a_max)).sub(float(a_min)).div(denom)
+    except TypeError:
+        x = np.clip(x, a_min, a_max)
+        return (x - float(a_min)) / denom
+
+
 
 def build_transforms(config: Config, mode: str = "train"):
     """Build MONAI transforms pipeline"""
     try:
         from monai.transforms import (
     Compose, LoadImaged, EnsureChannelFirstd, EnsureTyped,
-    Orientationd, Spacingd, ScaleIntensityRanged, NormalizeIntensityd,
+    Orientationd, Spacingd, NormalizeIntensityd,
     RandCropByPosNegLabeld, ResizeWithPadOrCropd, Resized,
     Rand3DElasticd, RandAdjustContrastd, RandGaussianNoised,
     RandGaussianSmoothd, RandFlipd, RandRotate90d, RandScaleIntensityd,
@@ -1004,13 +1019,9 @@ def build_transforms(config: Config, mode: str = "train"):
     if config.modality == "ct":
         a_min, a_max = getattr(config, "ct_window", (-100, 700))
         base_transforms.append(
-            ScaleIntensityRanged(
+            Lambdad(
                 keys=["image"],
-                a_min=float(a_min),
-                a_max=float(a_max),
-                b_min=0.0,
-                b_max=1.0,
-                clip=True,
+                func=lambda x, low=float(a_min), high=float(a_max): safe_ct_window(x, low, high),
             )
         )
     else:
@@ -1214,6 +1225,7 @@ def build_loss_function(pos_weight, logger: logging.Logger, use_focal: bool = Fa
         squared_pred=True,
         smooth_nr=1e-5,
         smooth_dr=1e-5,
+        include_background=False,
         reduction="mean",
     )
 
@@ -1242,6 +1254,9 @@ def build_loss_function(pos_weight, logger: logging.Logger, use_focal: bool = Fa
         sigmoid=True,
         alpha=float(tversky_alpha),
         beta=float(tversky_beta),
+        smooth_nr=1e-5,
+        smooth_dr=1e-5,
+        include_background=False,
         reduction="mean",
     )
 
@@ -1297,6 +1312,8 @@ class Trainer:
         self.use_tta = getattr(config, "use_tta", False)
         self.patience_counter = 0
         self.early_stop_patience = 15
+        self.empty_label_streak = 0
+        self.logged_batch_stats = 0
 
 
     def mixup_3d(self, x1, y1, x2, y2, alpha=0.2):
@@ -1319,6 +1336,40 @@ class Trainer:
             flipped_logits = torch.flip(model(flipped), dims=dims)
             logits = logits + flipped_logits
         return logits / 4.0
+        def _tensor_stats(self, tensor: torch.Tensor) -> Dict[str, float]:
+        return {
+            "min": float(tensor.min().item()),
+            "max": float(tensor.max().item()),
+            "mean": float(tensor.mean().item()),
+        }
+
+    def _log_nan_debug(self, step: int, loss_value, images, labels, logits):
+        with torch.no_grad():
+            stats = {}
+            try:
+                stats["loss"] = float(loss_value) if loss_value is not None else None
+            except Exception:
+                stats["loss"] = None
+            if isinstance(logits, (list, tuple)) and logits:
+                logits_sample = logits[0]
+            else:
+                logits_sample = logits
+            if logits_sample is not None:
+                stats["logits"] = self._tensor_stats(logits_sample)
+                probs = torch.sigmoid(logits_sample)
+                stats["probs"] = self._tensor_stats(probs)
+            stats["labels_sum"] = float(labels.sum().item()) if labels is not None else None
+            stats["images"] = self._tensor_stats(images) if images is not None else None
+            self.logger.error(
+                "NaN debugging (step=%d): loss=%s logits=%s probs=%s labels_sum=%s images=%s",
+                step,
+                stats.get("loss"),
+                stats.get("logits"),
+                stats.get("probs"),
+                stats.get("labels_sum"),
+                stats.get("images"),
+            )
+
 
     def train_epoch(self, model, loader, optimizer, loss_fn, scheduler, epoch):
         model.train()
@@ -1327,6 +1378,7 @@ class Trainer:
         accumulation_steps = max(1, self.config.accumulation_steps)
         effective_updates = 0
         last_raw_loss = None
+        accumulation_counter = 0
 
         optimizer.zero_grad(set_to_none=True)
         loader = self._prefetch_loader(loader) if self.use_cuda else loader
@@ -1336,23 +1388,49 @@ class Trainer:
             labels = batch["label"].to(self.config.device, non_blocking=self.non_blocking)
             if step == 1:
                 self.logger.info(f"[DEVICE] images device={images.device}, labels device={labels.device}")
+                        if not torch.isfinite(images).all():
+                self.logger.error("Non-finite values in images at step %d. Skipping batch.", step)
+                continue
+            if not torch.isfinite(labels).all():
+                self.logger.error("Non-finite values in labels at step %d. Skipping batch.", step)
+                continue
+            if self.logged_batch_stats < getattr(self.config, "debug_stats_batches", 0):
+                self.logger.info(
+                    "[Batch stats] step=%d images=%s labels_sum=%.4f",
+                    step,
+                    self._tensor_stats(images),
+                    float(labels.sum().item()),
+                )
+                self.logged_batch_stats += 1
+
+            label_sum = float(labels.sum().item())
+            if label_sum == 0.0:
+                self.empty_label_streak += 1
+                warn_threshold = int(getattr(self.config, "empty_label_warn_threshold", 5))
+                if warn_threshold > 0 and self.empty_label_streak % warn_threshold == 0:
+                    self.logger.warning(
+                        "Consecutive empty-label patches: %d (step %d)",
+                        self.empty_label_streak,
+                        step,
+                    )
+            else:
+                self.empty_label_streak = 0
 
             with torch.amp.autocast("cuda", enabled=self.use_amp):
                 logits = model(images)
                 raw_loss = loss_fn(logits, labels)
             if not torch.isfinite(raw_loss):
-                self.logger.error(
-                    "Non-finite loss detected (loss=%s). Stopping epoch early. Try --no-amp and/or lower --learning_rate.",
-                    str(raw_loss.detach().item()),
-                )
+                self._log_nan_debug(step, raw_loss.detach().item(), images, labels, logits)
+                self.logger.error("Non-finite loss detected; skipping batch.")
                 optimizer.zero_grad(set_to_none=True)
-                return float("inf")
+                continue
 
             loss = raw_loss / accumulation_steps
             if self.use_amp:
                 self.scaler.scale(loss).backward()
             else:
                 loss.backward()
+            accumulation_counter += 1
 
             raw_loss_value = float(raw_loss.item())
             running_loss += raw_loss_value
@@ -1360,7 +1438,7 @@ class Trainer:
             last_raw_loss = raw_loss_value
 
             did_update = False
-            if step % accumulation_steps == 0:
+            if accumulation_counter % accumulation_steps == 0:
                 if self.config.grad_clip_norm and self.config.grad_clip_norm > 0:
                     if self.use_amp:
                         self.scaler.unscale_(optimizer)
@@ -1383,7 +1461,7 @@ class Trainer:
                 "updates": effective_updates
             })
 
-        remainder = batches % accumulation_steps
+        remainder = accumulation_counter % accumulation_steps
         if remainder != 0 and last_raw_loss is not None:
             if self.config.grad_clip_norm and self.config.grad_clip_norm > 0:
                 if self.use_amp:
@@ -1452,6 +1530,12 @@ class Trainer:
                 is_first_batch = (n == 0)
                 images = batch["image"].to(self.config.device)
                 labels = batch["label"].to(self.config.device)
+                if not torch.isfinite(images).all():
+                    self.logger.error("Non-finite values in validation images. Skipping batch.")
+                    continue
+                if not torch.isfinite(labels).all():
+                    self.logger.error("Non-finite values in validation labels. Skipping batch.")
+                    continue
                 # DEBUG: Check raw label statistics
                 if is_first_batch:
                     labels_np = labels[0, 0].cpu().numpy() if labels.shape[1] == 1 else labels[0].cpu().numpy()
@@ -1482,6 +1566,10 @@ class Trainer:
                     self.logger.warning(f"Sliding window inference failed: {e}; using standard forward")
                     logits = self._forward_with_tta(model, images)
                 loss = loss_fn(logits, labels)
+                if not torch.isfinite(loss):
+                    self._log_nan_debug(n + 1, loss.detach().item(), images, labels, logits)
+                    self.logger.error("Non-finite validation loss detected; skipping batch.")
+                    continue
                 running_loss += loss.item()
                 n += 1
 
@@ -1738,10 +1826,19 @@ class Trainer:
             "optimizer_state": optimizer.state_dict(),
             "scheduler_state": scheduler.state_dict() if scheduler is not None else None,
             "best_loss": self.best_loss,
+            "rng_state": {
+                "python": random.getstate(),
+                "numpy": np.random.get_state(),
+                "torch": torch.get_rng_state(),
+                "torch_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+            },
         }
         p = self.config.checkpoint_dir / f"checkpoint_epoch_{epoch}.pt"
         torch.save(state, str(p))
         self.ckpt_last = str(p)
+        lastp = self.config.checkpoint_dir / "checkpoint_last.pt"
+        torch.save(state, str(lastp))
+        self.ckpt_last = str(lastp)
         if is_best:
             bestp = self.config.checkpoint_dir / "checkpoint_best.pt"
             shutil.copyfile(str(p), str(bestp))
@@ -1762,8 +1859,11 @@ class Trainer:
     def _find_alternate_checkpoint(self, failed_path: Path) -> Optional[Path]:
         candidates = []
         best = self.config.checkpoint_dir / "checkpoint_best.pt"
+        last = self.config.checkpoint_dir / "checkpoint_last.pt"
         if best.exists() and best != failed_path:
             candidates.append(best)
+        if last.exists() and last != failed_path:
+            candidates.append(last)
 
         epochs = sorted(
             self.config.checkpoint_dir.glob("checkpoint_epoch_*.pt"),
@@ -1825,6 +1925,25 @@ class Trainer:
             scheduler.load_state_dict(ckpt["scheduler_state"])
         if ckpt.get("best_loss") is not None:
             self.best_loss = ckpt["best_loss"]
+         rng_state = ckpt.get("rng_state")
+        if rng_state:
+            try:
+                random.setstate(rng_state.get("python"))
+            except Exception:
+                pass
+            try:
+                np.random.set_state(rng_state.get("numpy"))
+            except Exception:
+                pass
+            try:
+                torch.set_rng_state(rng_state.get("torch"))
+            except Exception:
+                pass
+            if torch.cuda.is_available() and rng_state.get("torch_cuda") is not None:
+                try:
+                    torch.cuda.set_rng_state_all(rng_state.get("torch_cuda"))
+                except Exception:
+                    pass
         return ckpt
 
     def train(self, model, train_loader, val_loader, optimizer, scheduler, loss_fn, metrics, start_epoch=0, writer=None):
@@ -2178,6 +2297,10 @@ def main(args):
                 matmul_precision = torch.get_float32_matmul_precision()
         except AttributeError:
             logger.debug("torch.set_float32_matmul_precision unavailable; using default precision.")
+    
+    if getattr(args, "detect_anomaly", False):
+        torch.autograd.set_detect_anomaly(True)
+        logger.info("Autograd anomaly detection enabled.")
         logger.info(
             "CUDA perf: benchmark=%s tf32(cuda)=%s tf32(cudnn)=%s matmul_precision=%s amp=%s",
             torch.backends.cudnn.benchmark,
@@ -2503,23 +2626,40 @@ def main(args):
     logger.info("7. training loop")
 
     trainer = Trainer(config, logger)
-    resume_path = args.resume
+    resume_enabled = True
+    resume_path = None
     auto_resume_used = False
-    if not resume_path and not getattr(args, "no_auto_resume", False):
+    resume_flag = getattr(args, "resume", "__AUTO__")
+    if resume_flag == "__DISABLE__":
+        resume_enabled = False
+    elif isinstance(resume_flag, str) and resume_flag not in ("__AUTO__", ""):
+        resume_path = resume_flag
+    if getattr(args, "resume_path", ""):
+        resume_path = args.resume_path
+    if getattr(args, "restart", False):
+        resume_enabled = False
+        resume_path = None
+
+    if resume_enabled and not resume_path and not getattr(args, "no_auto_resume", False):
         default_best = config.checkpoint_dir / "checkpoint_best.pt"
+        default_last = config.checkpoint_dir / "checkpoint_last.pt"
         if default_best.exists():
             resume_path = default_best
             auto_resume_used = True
+        elif default_last.exists():
+            resume_path = default_last
+            auto_resume_used = True
 
     start_epoch = 0
-    if resume_path:
+    loaded_checkpoint = None
+    if resume_enabled and resume_path:
         resume_path = Path(resume_path)
         if not resume_path.is_absolute():
             resume_path = config.checkpoint_dir / resume_path
         if not resume_path.exists():
             raise FileNotFoundError(f"Checkpoint not found: {resume_path}")
         if auto_resume_used:
-            logger.info(f"Auto-resuming from best checkpoint: {resume_path}")
+            logger.info(f"Auto-resuming from checkpoint: {resume_path}")
         else:
             logger.info(f"Resuming training from checkpoint: {resume_path}")
         try:
@@ -2536,17 +2676,32 @@ def main(args):
                     f"configuration: {err}\nStarting a fresh training run instead."
                 )
                 resume_path = None
+                resume_enabled = False
             else:
                 raise
         else:
             trainer.ckpt_last = str(resume_path)
             start_epoch = int(ckpt.get("epoch", 0))
+            loaded_checkpoint = str(resume_path)
+            resume_lr_factor = float(getattr(args, "resume_lr_factor", 1.0))
+            if resume_lr_factor != 1.0:
+                for param_group in optimizer.param_groups:
+                    param_group["lr"] *= resume_lr_factor
+                logger.info("Applied resume LR factor: %.3f", resume_lr_factor)
             logger.info(
                 f"Checkpoint loaded (epoch {start_epoch}). Continuing for {config.epochs} additional epochs."
             )
 
-    if resume_path is None:
+    if not resume_enabled or resume_path is None:
         logger.info("No checkpoint resume requested; starting from scratch.")
+        
+    logger.info(
+        "Resume=%s, Restart=%s, Loaded checkpoint=%s, start_epoch=%d",
+        bool(resume_enabled),
+        bool(getattr(args, "restart", False)),
+        loaded_checkpoint,
+        start_epoch,
+    )
 
     tb_writer = None
     if getattr(args, "tensorboard", False):
@@ -2693,7 +2848,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--learning_rate",
         type=float,
-        default=2e-4,
+        default=1e-4,
         help="Initial learning rate"
     )
     parser.add_argument(
@@ -2709,10 +2864,16 @@ if __name__ == "__main__":
         help="ROI size for training (format: H,W,D)"
     )
     parser.add_argument(
-        "--grad_clip_norm",
+        "--grad_clip",
         type=float,
         default=1.0,
         help="Gradient clipping norm value (set <=0 to disable)"
+    )
+    parser.add_argument(
+        "--grad_clip_norm",
+        type=float,
+        default=None,
+        help="(Deprecated) Gradient clipping norm value (set <=0 to disable)"
     )
     parser.add_argument(
         "--num_samples",
@@ -2818,6 +2979,11 @@ if __name__ == "__main__":
         help="Disable CUDA mixed precision (AMP).",
     )
     parser.add_argument(
+        "--detect_anomaly",
+        action="store_true",
+        help="Enable autograd anomaly detection for debugging."
+    )
+    parser.add_argument(
         "--cache_train",
         type=float,
         default=0.0,
@@ -2896,9 +3062,34 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--resume",
+        nargs="?",
+        const="__AUTO__",
+        default="__AUTO__",
+        help="Resume training (optionally provide checkpoint path). Use --no-resume or --restart to disable."
+    )
+    parser.add_argument(
+        "--no-resume",
+        dest="resume",
+        action="store_const",
+        const="__DISABLE__",
+        help="Disable resume entirely (overrides auto-detect)."
+    )
+    parser.add_argument(
+        "--resume_path",
         type=str,
-        default=None,
-        help="Path to checkpoint file to resume from (relative to checkpoints/ if not absolute)"
+        default="",
+        help="Checkpoint path to resume from (relative to checkpoints/ if not absolute)."
+    )
+    parser.add_argument(
+        "--restart",
+        action="store_true",
+        help="Start training from scratch even if checkpoints exist."
+    )
+    parser.add_argument(
+        "--resume_lr_factor",
+        type=float,
+        default=1.0,
+        help="Scale learning rate when resuming (e.g., 0.5 to reduce LR)."
     )
     parser.add_argument(
         "--use_tta",
